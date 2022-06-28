@@ -1,16 +1,22 @@
 name: Deploy to Fly
 on:
+  schedule:
+    - cron: 0 19 1,16 * *
   workflow_dispatch:
 
 jobs:
   fly:
-    name: Deploy
+    name: Prepare
     runs-on: ubuntu-latest
+    outputs:
+      RUN_NAME: ${{ steps.prepare.outputs.RUN_NAME }}
+      RUN_TOKEN: ${{ steps.prepare.outputs.RUN_TOKEN }}
+      STOP_NAME: ${{ steps.prepare.outputs.STOP_NAME }}
+      STOP_TOKEN: ${{ steps.prepare.outputs.STOP_TOKEN }}
     steps:
-      - uses: actions/checkout@v3
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Prepare & Deploy
-        continue-on-error: true
+      - name: Prepare
+        id: prepare
         run: |
           #secret中FLY_APP格式为 应用名,token
           #多个FLY_APP以;分割
@@ -20,35 +26,76 @@ jobs:
             num=$(( num+1 ))
             NAME=$(echo $app |cut -d\, -f1)
             TOKEN=$(echo $app |cut -d\, -f2)
-            sed -i "/^app /s#\".*\"#\"$NAME\"#" fly.toml
-            sed -i "/AUUID/s#\".*\"#\"${{ secrets.AUUID }}\"#" fly.toml
-            sed -i "/ArgoCERT/s#\".*\"#\"${{ secrets.ARGOCERT }}\"#" fly.toml
-            sed -i "/ArgoJSON/s#\".*\"#\"${{ secrets.ARGOJSON }}\"#" fly.toml
-            sed -i "/ArgoDOMAIN/s#\".*\"#\"${{ secrets.ARGODOMAIN }}\"#" fly.toml
-            if [ $num -gt 1 ]; then
-              killall flyctl
-            fi
-            if ! [ -d "~/.fly" ]; then
-              mkdir -p ~/.fly
-              echo "access_token: $TOKEN" > ~/.fly/config.yml
-            fi
-            appStatus=$(flyctl list apps --access-token "$TOKEN")
-            if echo "$appStatus" |grep -q "$NAME.*running"; then
-              flyctl deploy --detach --remote-only --region "sin" --access-token "$TOKEN"
-            elif echo "$appStatus" |grep -q "$NAME.*dead"; then
-              flyctl scale count 1 --app "$NAME" --access-token "$TOKEN"
-              flyctl deploy --remote-only --region "sin" --access-token "$TOKEN"
-              flyctl scale count 0 --app "$NAME" --access-token "$TOKEN"
+            #半个月切换一次
+            if [ "$(date +%d)" -le 15 ]; then
+              if [ $num -eq 1 ]; then
+                echo "::set-output name=RUN_NAME::$NAME"
+                echo "::set-output name=RUN_TOKEN::$TOKEN"
+              else
+                echo "::set-output name=STOP_NAME::$NAME"
+                echo "::set-output name=STOP_TOKEN::$TOKEN"
+              fi
             else
-              flyctl launch --copy-config --now --name "$NAME" --region "sin" --access-token "$TOKEN"
-              #if [ "$(date +%d)" -le 15 ]; then
-              #  if [ $num -ne 1 ]; then
-              #    flyctl scale count 0 --app "$NAME" --access-token "$TOKEN"
-              #  fi
-              #else
-              #  if [ $num -eq 1 ]; then
-              #    flyctl scale count 0 --app "$NAME" --access-token "$TOKEN"
-              #  fi
-              #fi
+              if [ $num -eq 1 ]; then
+                echo "::set-output name=STOP_NAME::$NAME"
+                echo "::set-output name=STOP_TOKEN::$TOKEN"
+              else
+                echo "::set-output name=RUN_NAME::$NAME"
+                echo "::set-output name=RUN_TOKEN::$TOKEN"
+              fi
             fi
           done
+
+  stop:
+    needs: fly
+    name: Stop Node
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Env And Add Mask
+        id: env
+        run: |
+          echo "::add-mask::${{ needs.fly.outputs.STOP_NAME }}"
+          echo "::add-mask::${{ needs.fly.outputs.STOP_TOKEN }}"
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Stop
+        run: |
+          if ! [ -d "~/.fly" ]; then
+            mkdir -p ~/.fly
+            echo "access_token: ${{ needs.fly.outputs.STOP_TOKEN }}" > ~/.fly/config.yml
+          fi
+          flyctl scale count 0 --app "${{ needs.fly.outputs.STOP_NAME }}" --access-token "${{ needs.fly.outputs.STOP_TOKEN }}"
+
+  run:
+    needs: fly
+    name: Run Node
+    runs-on: ubuntu-latest
+    env:
+      REGION: lax
+    steps:
+      - name: Set Env And Add Mask
+        id: env
+        run: |
+          echo "::add-mask::${{ needs.fly.outputs.RUN_NAME }}"
+          echo "::add-mask::${{ needs.fly.outputs.RUN_TOKEN }}"
+      - uses: actions/checkout@v3
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Run Node
+        run: |
+          sed -i "/  app /s#\".*\"#\"${{ needs.fly.outputs.RUN_NAME }}\"#" fly.toml
+          sed -i "/AUUID/s#\".*\"#\"${{ secrets.AUUID }}\"#" fly.toml
+          sed -i "/ArgoCERT/s#\".*\"#\"${{ secrets.ARGOCERT }}\"#" fly.toml
+          sed -i "/ArgoJSON/s#\".*\"#\"${{ secrets.ARGOJSON }}\"#" fly.toml
+          sed -i "/ArgoDOMAIN/s#\".*\"#\"${{ secrets.ARGODOMAIN }}\"#" fly.toml
+          if ! [ -d "~/.fly" ]; then
+            mkdir -p ~/.fly
+            echo "access_token: ${{ needs.fly.outputs.RUN_TOKEN }}" > ~/.fly/config.yml
+          fi
+          appStatus=$(flyctl list apps --access-token "${{ needs.fly.outputs.RUN_TOKEN }}")
+          if echo "$appStatus" |grep -q "${{ needs.fly.outputs.RUN_NAME }}.*running"; then
+            flyctl deploy --detach --remote-only --region "${{ env.REGION }}" --access-token "${{ needs.fly.outputs.RUN_TOKEN }}"
+          elif echo "$appStatus" |grep -q "${{ needs.fly.outputs.RUN_NAME }}.*dead"; then
+            flyctl scale count 1 --app "${{ needs.fly.outputs.RUN_NAME }}" --access-token "${{ needs.fly.outputs.RUN_TOKEN }}"
+            flyctl deploy --remote-only --region "${{ env.REGION }}" --access-token "${{ needs.fly.outputs.RUN_TOKEN }}"
+          else
+              flyctl launch --copy-config --now --name "${{ needs.fly.outputs.RUN_NAME }}" --region "${{ env.REGION }}" --access-token "${{ needs.fly.outputs.RUN_TOKEN }}"
+          fi
